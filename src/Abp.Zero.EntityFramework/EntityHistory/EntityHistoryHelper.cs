@@ -12,60 +12,22 @@ using System.Transactions;
 using Abp.Auditing;
 using Abp.Dependency;
 using Abp.Domain.Entities;
-using Abp.Domain.Entities.Auditing;
 using Abp.Domain.Uow;
 using Abp.EntityHistory.Extensions;
 using Abp.Events.Bus.Entities;
 using Abp.Extensions;
 using Abp.Json;
-using Abp.Runtime.Session;
-using Abp.Timing;
-using Castle.Core.Logging;
 using JetBrains.Annotations;
 
 namespace Abp.EntityHistory
 {
-    public class EntityHistoryHelper : IEntityHistoryHelper, ITransientDependency
+    public class EntityHistoryHelper : EntityHistoryHelperBase, IEntityHistoryHelper, ITransientDependency
     {
-        public ILogger Logger { get; set; }
-        public IAbpSession AbpSession { get; set; }
-        public IClientInfoProvider ClientInfoProvider { get; set; }
-        public IEntityChangeSetReasonProvider EntityChangeSetReasonProvider { get; set; }
-        public IEntityHistoryStore EntityHistoryStore { get; set; }
-
-        private readonly IEntityHistoryConfiguration _configuration;
-        private readonly IUnitOfWorkManager _unitOfWorkManager;
-
-        private bool IsEntityHistoryEnabled
-        {
-            get
-            {
-                if (!_configuration.IsEnabled)
-                {
-                    return false;
-                }
-
-                if (!_configuration.IsEnabledForAnonymousUsers && (AbpSession?.UserId == null))
-                {
-                    return false;
-                }
-
-                return true;
-            }
-        }
-
         public EntityHistoryHelper(
             IEntityHistoryConfiguration configuration,
             IUnitOfWorkManager unitOfWorkManager)
+            : base(configuration, unitOfWorkManager)
         {
-            _configuration = configuration;
-            _unitOfWorkManager = unitOfWorkManager;
-
-            AbpSession = NullAbpSession.Instance;
-            Logger = NullLogger.Instance;
-            ClientInfoProvider = NullClientInfoProvider.Instance;
-            EntityChangeSetReasonProvider = NullEntityChangeSetReasonProvider.Instance;
-            EntityHistoryStore = NullEntityHistoryStore.Instance;
         }
 
         public virtual EntityChangeSet CreateEntityChangeSet(DbContext context)
@@ -89,7 +51,7 @@ namespace Abp.EntityHistory
                 return changeSet;
             }
 
-            var objectContext = ((IObjectContextAdapter)context).ObjectContext;
+            var objectContext = context.As<IObjectContextAdapter>().ObjectContext;
             var relationshipChanges = objectContext.ObjectStateManager
                 .GetObjectStateEntries(EntityState.Added | EntityState.Deleted)
                 .Where(state => state.IsRelationship)
@@ -141,10 +103,31 @@ namespace Abp.EntityHistory
 
             UpdateChangeSet(context, changeSet);
 
-            using (var uow = _unitOfWorkManager.Begin(TransactionScopeOption.Suppress))
+            using (var uow = UnitOfWorkManager.Begin(TransactionScopeOption.Suppress))
             {
                 await EntityHistoryStore.SaveAsync(changeSet);
                 await uow.CompleteAsync();
+            }
+        }
+
+        public virtual void Save(DbContext context, EntityChangeSet changeSet)
+        {
+            if (!IsEntityHistoryEnabled)
+            {
+                return;
+            }
+
+            if (changeSet.EntityChanges.Count == 0)
+            {
+                return;
+            }
+
+            UpdateChangeSet(context, changeSet);
+
+            using (var uow = UnitOfWorkManager.Begin(TransactionScopeOption.Suppress))
+            {
+                EntityHistoryStore.Save(changeSet);
+                uow.Complete();
             }
         }
 
@@ -173,14 +156,14 @@ namespace Abp.EntityHistory
                 case EntityState.Detached:
                 case EntityState.Unchanged:
                 default:
-                    Logger.Error("Unexpected EntityState!");
+                    Logger.ErrorFormat("Unexpected {0} - {1}", nameof(entityEntry.State), entityEntry.State);
                     return null;
             }
 
             var entityId = GetEntityId(entityEntry, entityType);
             if (entityId == null && changeType != EntityChangeType.Created)
             {
-                Logger.Error("Unexpected null value for entityId!");
+                Logger.ErrorFormat("EntityChangeType {0} must have non-empty entity id", changeType);
                 return null;
             }
 
@@ -194,23 +177,6 @@ namespace Abp.EntityHistory
             };
 
             return entityChange;
-        }
-
-        private DateTime GetChangeTime(EntityChange entityChange)
-        {
-            var entity = entityChange.EntityEntry.As<DbEntityEntry>().Entity;
-            switch (entityChange.ChangeType)
-            {
-                case EntityChangeType.Created:
-                    return (entity as IHasCreationTime)?.CreationTime ?? Clock.Now;
-                case EntityChangeType.Deleted:
-                    return (entity as IHasDeletionTime)?.DeletionTime ?? Clock.Now;
-                case EntityChangeType.Updated:
-                    return (entity as IHasModificationTime)?.LastModificationTime ?? Clock.Now;
-                default:
-                    Logger.Error("Unexpected EntityState!");
-                    return Clock.Now;
-            }
         }
 
         private EntityType GetEntityType(ObjectContext context, Type entityType, bool useClrType = true)
@@ -363,7 +329,7 @@ namespace Abp.EntityHistory
                 return false;
             }
 
-            if (_configuration.IgnoredTypes.Any(t => t.IsInstanceOfType(entityEntry.Entity)))
+            if (EntityHistoryConfiguration.IgnoredTypes.Any(t => t.IsInstanceOfType(entityEntry.Entity)))
             {
                 return false;
             }
@@ -400,7 +366,7 @@ namespace Abp.EntityHistory
                 return true;
             }
 
-            if (_configuration.Selectors.Any(selector => selector.Predicate(entityType)))
+            if (EntityHistoryConfiguration.Selectors.Any(selector => selector.Predicate(entityType)))
             {
                 return true;
             }
@@ -477,13 +443,12 @@ namespace Abp.EntityHistory
         {
             foreach (var entityChange in changeSet.EntityChanges)
             {
-                /* Update change time */
+                var entityEntry = entityChange.EntityEntry.As<DbEntityEntry>();
 
-                entityChange.ChangeTime = GetChangeTime(entityChange);
+                /* Update change time */
+                entityChange.ChangeTime = GetChangeTime(entityChange.ChangeType, entityEntry.Entity);
 
                 /* Update entity id */
-
-                var entityEntry = entityChange.EntityEntry.As<DbEntityEntry>();
                 var entityType = GetEntityType(context.As<IObjectContextAdapter>().ObjectContext, entityEntry.GetEntityBaseType(), useClrType: false);
                 entityChange.EntityId = GetEntityId(entityEntry, entityType);
 
